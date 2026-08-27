@@ -5,7 +5,6 @@ completion of TeraBox anti-bot challenges while preserving the exact session con
 """
 
 import asyncio
-import base64
 import logging
 import os
 import secrets
@@ -52,6 +51,15 @@ class BrowserVerificationSession:
         remaining = int(self.expires_at - time.time())
         return max(0, remaining)
 
+    def is_page_healthy(self) -> bool:
+        """Check if browser, context, and page are alive and ready."""
+        if not self.context or not self.page:
+            return False
+        try:
+            return not self.page.is_closed()
+        except Exception:
+            return False
+
 
 class BrowserSessionManager:
     """Thread-safe manager for Playwright browser verification sessions."""
@@ -67,21 +75,25 @@ class BrowserSessionManager:
         if self._global_browser and self._global_browser.is_connected():
             return self._global_playwright, self._global_browser
             
-        from playwright.async_api import async_playwright
-        self._global_playwright = await async_playwright().start()
-        self._global_browser = await self._global_playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-gpu",
-                "--single-process",
-            ],
-        )
-        logger.info("[Verification] browser_started")
-        return self._global_playwright, self._global_browser
+        logger.info("[TeraBox Verification] browser_starting")
+        try:
+            from playwright.async_api import async_playwright
+            self._global_playwright = await async_playwright().start()
+            self._global_browser = await self._global_playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-gpu",
+                ],
+            )
+            logger.info("[TeraBox Verification] browser_started")
+            return self._global_playwright, self._global_browser
+        except Exception as e:
+            logger.exception(f"[TeraBox Verification] Failed to start Chromium browser: {e}")
+            raise
 
     async def create_session(
         self,
@@ -90,8 +102,9 @@ class BrowserSessionManager:
         password: str = "",
         verification_url: str = "",
         files: Optional[List[Dict[str, Any]]] = None,
+        auto_start_browser: bool = True,
     ) -> BrowserVerificationSession:
-        """Create a new isolated browser context and session."""
+        """Create a new isolated browser context, initialize page, and start navigation immediately."""
         session_id = secrets.token_urlsafe(24)
         clean_surl = surl[1:] if surl.startswith("1") else surl
         v_url = verification_url or f"https://1024terabox.com/s/1{clean_surl}"
@@ -116,18 +129,20 @@ class BrowserSessionManager:
             )
             self._sessions[session_id] = session
 
-        logger.info(f"[Verification] session_created sessionId={session_id[:8]}***")
+        logger.info(f"[TeraBox Verification] session_created sessionId={session_id[:8]}***")
+
+        # Immediately start browser and navigate page when verification is detected
+        if auto_start_browser:
+            try:
+                await self._init_browser_and_page(session)
+            except Exception as e:
+                logger.warning(f"[TeraBox Verification] Async browser initialization deferred/failed: {e}")
+
         return session
 
-    async def ensure_page_loaded(self, session_id: str) -> Optional[BrowserVerificationSession]:
-        """Ensure the Playwright browser context and page are open and navigating."""
-        session = self.get_session(session_id)
-        if not session or session.is_expired():
-            return None
-
-        if session.page is not None and not session.page.is_closed():
-            return session
-
+    async def _init_browser_and_page(self, session: BrowserVerificationSession) -> None:
+        """Initialize context, create page, attach listeners, and navigate."""
+        session_id = session.session_id
         try:
             playwright_inst, browser = await self.get_or_create_browser()
             context = await browser.new_context(
@@ -137,8 +152,9 @@ class BrowserSessionManager:
                 timezone_id="America/New_York",
             )
             page = await context.new_page()
+            logger.info(f"[TeraBox Verification] page_created sessionId={session_id[:8]}***")
 
-            # Intercept download requests or direct CDN links
+            # Intercept direct CDN download links
             async def handle_response(response):
                 try:
                     res_url = response.url
@@ -150,21 +166,38 @@ class BrowserSessionManager:
 
             page.on("response", handle_response)
 
-            target_url = session.verification_url or session.url
-            logger.info(f"[Verification] verification_pending sessionId={session_id[:8]}*** navigating=YES")
-            session.state = "verifying"
-            
-            await page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
-            await asyncio.sleep(1.5)  # Allow dynamic scripts to mount
-
             session.context = context
             session.page = page
+            session.state = "verifying"
             session.last_activity = time.time()
-            return session
+
+            target_url = session.verification_url or session.url
+            logger.info(f"[TeraBox Verification] page_navigation_started sessionId={session_id[:8]}***")
+            
+            # Navigate with 30s timeout
+            try:
+                await page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
+                await asyncio.sleep(1.0)
+                logger.info(f"[TeraBox Verification] page_navigation_completed sessionId={session_id[:8]}***")
+            except Exception as nav_err:
+                logger.warning(f"[TeraBox Verification] Navigation non-fatal timeout for {session_id[:8]}***: {nav_err}")
+                
+            logger.info(f"[TeraBox Verification] verification_pending sessionId={session_id[:8]}***")
         except Exception as e:
-            logger.exception(f"Error launching page for session {session_id[:8]}***: {e}")
+            logger.exception(f"[TeraBox Verification] Error initializing page for session {session_id[:8]}***: {e}")
             session.state = "failed"
+
+    async def ensure_page_loaded(self, session_id: str) -> Optional[BrowserVerificationSession]:
+        """Ensure the Playwright browser context and page are open and ready."""
+        session = self.get_session(session_id)
+        if not session or session.is_expired():
+            return None
+
+        if session.is_page_healthy():
             return session
+
+        await self._init_browser_and_page(session)
+        return session
 
     def get_session(self, session_id: str) -> Optional[BrowserVerificationSession]:
         """Synchronously lookup a session by ID if not expired."""
@@ -174,13 +207,14 @@ class BrowserSessionManager:
                 return None
             if session.is_expired():
                 session.state = "expired"
+                logger.info(f"[TeraBox Verification] session_expired sessionId={session_id[:8]}***")
                 return None
             return session
 
     async def get_screenshot(self, session_id: str) -> Optional[bytes]:
         """Capture live screenshot of the verification page."""
         session = await self.ensure_page_loaded(session_id)
-        if not session or not session.page or session.page.is_closed():
+        if not session or not session.is_page_healthy():
             return None
         try:
             screenshot = await session.page.screenshot(type="jpeg", quality=75)
@@ -194,9 +228,10 @@ class BrowserSessionManager:
     async def forward_click(self, session_id: str, x: int, y: int) -> bool:
         """Forward mouse click event to Playwright page."""
         session = await self.ensure_page_loaded(session_id)
-        if not session or not session.page or session.page.is_closed():
+        if not session or not session.is_page_healthy():
             return False
         try:
+            logger.info(f"[TeraBox Verification] verification_activity_detected sessionId={session_id[:8]}*** action=click")
             await session.page.mouse.click(x, y)
             session.last_activity = time.time()
             await asyncio.sleep(0.5)
@@ -208,9 +243,10 @@ class BrowserSessionManager:
     async def forward_drag(self, session_id: str, from_x: int, from_y: int, to_x: int, to_y: int, steps: int = 15) -> bool:
         """Forward mouse drag/slide event to Playwright page (for slider puzzle CAPTCHAs)."""
         session = await self.ensure_page_loaded(session_id)
-        if not session or not session.page or session.page.is_closed():
+        if not session or not session.is_page_healthy():
             return False
         try:
+            logger.info(f"[TeraBox Verification] verification_activity_detected sessionId={session_id[:8]}*** action=drag")
             await session.page.mouse.move(from_x, from_y)
             await session.page.mouse.down()
             await asyncio.sleep(0.05)
@@ -227,9 +263,10 @@ class BrowserSessionManager:
     async def forward_type(self, session_id: str, text: str) -> bool:
         """Forward text typing to active element on Playwright page."""
         session = await self.ensure_page_loaded(session_id)
-        if not session or not session.page or session.page.is_closed():
+        if not session or not session.is_page_healthy():
             return False
         try:
+            logger.info(f"[TeraBox Verification] verification_activity_detected sessionId={session_id[:8]}*** action=type")
             await session.page.keyboard.type(text)
             session.last_activity = time.time()
             return True
@@ -243,12 +280,13 @@ class BrowserSessionManager:
         if not session:
             return False, None, "Session expired or not found"
         
-        logger.info(f"[Verification] direct_resolution_started sessionId={session_id[:8]}***")
+        logger.info(f"[TeraBox Verification] direct_resolution_started sessionId={session_id[:8]}***")
 
         # 1. Check if intercepted URLs contain a valid direct download link
         for direct_url in session.intercepted_download_urls:
             if is_valid_direct_download_url(direct_url):
-                logger.info(f"[Verification] direct_resolution_success sessionId={session_id[:8]}*** source=intercepted")
+                logger.info(f"[TeraBox Verification] direct_resolution_success sessionId={session_id[:8]}*** source=intercepted")
+                logger.info(f"[TeraBox Verification] verification_completed sessionId={session_id[:8]}***")
                 session.state = "completed"
                 session.verified = True
                 files = [{
@@ -259,27 +297,28 @@ class BrowserSessionManager:
                 }]
                 return True, files, None
 
-        # 2. Evaluate in-page state and trigger download if needed
-        if session.page and not session.page.is_closed():
+        # 2. Evaluate in-page state and extract genuine download link
+        if session.is_page_healthy():
             try:
-                # Check for in-page download URLs
                 found_links = await session.page.evaluate("""() => {
                     const links = [];
-                    // Look for dlink / download attributes
+                    // Check direct download anchor elements
                     document.querySelectorAll('a[href*="download"], a[href*="d.terabox"], a[href*="dlink"]').forEach(el => {
                         if (el.href) links.push(el.href);
                     });
-                    // Look in window globals
+                    // Check window global state
                     if (window.yunData && window.yunData.file_list) {
                         window.yunData.file_list.forEach(f => {
                             if (f.dlink) links.push(f.dlink);
+                            if (f.direct_link) links.push(f.direct_link);
                         });
                     }
                     return links;
                 }""")
                 for link in found_links or []:
                     if is_valid_direct_download_url(link):
-                        logger.info(f"[Verification] direct_resolution_success sessionId={session_id[:8]}*** source=page_eval")
+                        logger.info(f"[TeraBox Verification] direct_resolution_success sessionId={session_id[:8]}*** source=page_eval")
+                        logger.info(f"[TeraBox Verification] verification_completed sessionId={session_id[:8]}***")
                         session.state = "completed"
                         session.verified = True
                         files = [{
@@ -292,14 +331,15 @@ class BrowserSessionManager:
             except Exception as e:
                 logger.debug(f"In-page evaluation exception: {e}")
 
-        # 3. If no direct link yet, check if verification is still required on the page
-        logger.info(f"[Verification] provider_verification_still_required sessionId={session_id[:8]}***")
+        # 3. If no direct link yet, verification challenge is still pending
+        logger.info(f"[TeraBox Verification] direct_resolution_failed sessionId={session_id[:8]}*** reason=provider_verification_required")
         return False, None, "provider_verification_required"
 
     async def _close_session(self, session_id: str):
         """Close context and page for a specific session."""
         session = self._sessions.pop(session_id, None)
         if session:
+            logger.info(f"[TeraBox Verification] session_cleanup sessionId={session_id[:8]}***")
             try:
                 if session.context:
                     await session.context.close()
@@ -311,7 +351,7 @@ class BrowserSessionManager:
         now = time.time()
         expired_ids = [sid for sid, s in self._sessions.items() if s.expires_at <= now]
         for sid in expired_ids:
-            logger.info(f"[Verification] verification_expired sessionId={sid[:8]}***")
+            logger.info(f"[TeraBox Verification] session_expired sessionId={sid[:8]}***")
             await self._close_session(sid)
 
 
@@ -338,3 +378,42 @@ def is_valid_direct_download_url(url: Optional[str]) -> bool:
         return True
     except Exception:
         return False
+
+
+def check_environment_diagnostics() -> Dict[str, Any]:
+    """Inspect and log startup diagnostics for Playwright and Chromium."""
+    playwright_available = False
+    chromium_available = False
+    
+    try:
+        import playwright
+        playwright_available = True
+    except ImportError:
+        pass
+
+    if playwright_available:
+        try:
+            # Check if chromium browser driver/binary is found
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                exec_path = p.chromium.executable_path
+                if exec_path:
+                    chromium_available = True
+        except Exception:
+            chromium_available = playwright_available
+
+    browser_manager_ready = playwright_available and chromium_available
+    worker_count = int(os.getenv("GUNICORN_WORKERS", os.getenv("WEB_CONCURRENCY", "1")))
+
+    logger.info(
+        f"[TeraBox Startup] playwright_available={'YES' if playwright_available else 'NO'} "
+        f"chromium_available={'YES' if chromium_available else 'NO'} "
+        f"browser_session_manager_ready={'YES' if browser_manager_ready else 'NO'} "
+        f"worker_count={worker_count}"
+    )
+    return {
+        "playwright_available": playwright_available,
+        "chromium_available": chromium_available,
+        "browser_session_manager_ready": browser_manager_ready,
+        "worker_count": worker_count,
+    }

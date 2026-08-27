@@ -34,7 +34,7 @@ from .terabox_client import (
     _normalize_api2_items,
 )
 from .session_store import session_store, is_valid_direct_download_url
-from .browser_session import browser_session_manager, BrowserVerificationSession
+from .browser_session import browser_session_manager, BrowserVerificationSession, check_environment_diagnostics
 from .verification_ui import render_verification_ui
 from .rate_limiter import rate_limit
 from . import cache
@@ -65,6 +65,13 @@ def create_app() -> Flask:
     """
 
     app = Flask(__name__, static_folder="swagger", static_url_path="/swagger")
+    
+    # Run startup environment check
+    try:
+        check_environment_diagnostics()
+    except Exception as e:
+        logging.warning(f"Startup diagnostic non-fatal exception: {e}")
+        
     return app
 
 
@@ -465,6 +472,7 @@ async def verification_ui_route(session_id):
                 "message": "Verification session has expired or does not exist",
             }), 404
 
+    logger.info(f"[TeraBox Verification] verification_ui_opened sessionId={session_id[:8]}***")
     # Ensure browser context is loading the page
     await browser_session_manager.ensure_page_loaded(session_id)
     
@@ -536,6 +544,7 @@ async def get_verification_session_status_route(session_id):
         }), 410
 
     state_str = getattr(session, "state", getattr(session, "verification_state", "pending"))
+    logger.info(f"[TeraBox Verification] verification_state_check sessionId={session_id[:8]}*** state={state_str}")
     return jsonify({
         "status": f"verification_{state_str}",
         "session_id": session.session_id,
