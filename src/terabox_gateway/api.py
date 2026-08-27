@@ -321,6 +321,7 @@ async def api():
                         "message": link_data.get("message") or link_data.get("error") or "Provider resolution failed",
                         "requires_verification": is_verification,
                         "requires_password": link_data.get("requires_password", False),
+                        "verification_url": link_data.get("verification_url") or (url if is_verification else None),
                         "stage": "provider_resolution",
                     }
                 ),
@@ -365,6 +366,7 @@ async def api():
                             "message": resolved_data.get("message") or resolved_data.get("error") or "Direct link resolution failed",
                             "requires_verification": is_verification,
                             "requires_password": resolved_data.get("requires_password", False),
+                            "verification_url": resolved_data.get("verification_url") or (url if is_verification else None),
                             "stage": "direct_link_resolution",
                         }
                     ),

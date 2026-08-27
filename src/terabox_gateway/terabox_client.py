@@ -1,7 +1,7 @@
 """TeraBox API client module.
 
 This module handles all interactions with the TeraBox API,
-including fetching file information, download links, and formatting responses.
+including fetching file information, direct download links, and formatting responses.
 """
 
 import asyncio
@@ -12,7 +12,10 @@ from urllib.parse import parse_qs, urlparse
 import aiohttp
 
 from .config import headers, load_cookies
-from .utils import find_between, extract_thumbnail_dimensions, get_formatted_size, request_with_retry
+from .utils import extract_thumbnail_dimensions, get_formatted_size, request_with_retry
+
+
+logger = logging.getLogger("terabox_gateway")
 
 
 class FileList(list):
@@ -21,13 +24,45 @@ class FileList(list):
     used_cookies: bool = False
 
 
+def log_sanitized_stage_diagnostics(
+    stage: str,
+    endpoint_path: str,
+    http_status: Union[int, str],
+    errno: Union[int, str, None] = None,
+    errmsg: Optional[str] = None,
+    cookies: Optional[Dict[str, str]] = None,
+    js_token: Optional[str] = None,
+    dp_log_id: Optional[str] = None,
+    signing_params: Optional[Dict[str, Any]] = None,
+    verification_url: Optional[str] = None,
+    interactive_verification: bool = False,
+):
+    """Log sanitized diagnostics without exposing sensitive secrets, cookies, or full query parameters."""
+    ndus_present = "YES" if (cookies and ("ndus" in cookies or "NDUS" in cookies)) else "NO"
+    csrf_present = "YES" if (cookies and ("csrfToken" in cookies or "csrf" in cookies)) else "NO"
+    session_cookies_present = "YES" if (cookies and len(cookies) > 0) else "NO"
+    js_token_present = "YES" if bool(js_token) else "NO"
+    dp_log_id_present = "YES" if bool(dp_log_id) else "NO"
+    signing_params_present = "YES" if bool(signing_params and all(k in signing_params for k in ("sign1", "sign3"))) else "NO"
+    verification_url_present = "YES" if bool(verification_url) else "NO"
+    interactive_req = "YES" if interactive_verification else "NO"
+    
+    clean_errmsg = str(errmsg)[:60].replace("\n", " ") if errmsg else "NONE"
+
+    logger.info(
+        f"[TeraBox Diagnostics] stage={stage} endpoint={endpoint_path} httpStatus={http_status} "
+        f"errno={errno if errno is not None else 'NONE'} errmsg=\"{clean_errmsg}\" "
+        f"ndusPresent={ndus_present} csrfPresent={csrf_present} cookiesPresent={session_cookies_present} "
+        f"jsTokenPresent={js_token_present} dpLogIdPresent={dp_log_id_present} "
+        f"signingParamsPresent={signing_params_present} verificationUrlPresent={verification_url_present} "
+        f"interactiveVerificationRequired={interactive_req}"
+    )
+
+
 async def fetch_download_link(
     url: str, password: str = ""
 ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
     """Fetch file information from TeraBox share link using unified proxy API.
-    
-    This function uses the unified Cloudflare Worker proxy with mode=resolve,
-    which automatically handles jsToken extraction and API calls in a single request.
     
     Args:
         url: TeraBox share URL
@@ -46,41 +81,48 @@ async def fetch_download_link(
         elif "/s/" in parsed_url.path:
             surl = parsed_url.path.split("/s/")[1].split("/")[0].split("?")[0]
         else:
-            logging.error("Could not extract surl from URL")
-            return {"error": "Invalid URL format", "errno": -1}
+            logger.error("Could not extract surl from URL")
+            return {
+                "status": "error",
+                "error": "invalid_url_format",
+                "errno": -1,
+                "message": "Could not extract share code from URL",
+                "stage": "parameter_validation"
+            }
         
-        # Remove leading "1" if present (TeraBox shortcode format)
-        if surl.startswith("1"):
-            surl = surl[1:]
+        # Normalize surl
+        clean_code = surl[1:] if surl.startswith("1") else surl
+        verification_link = f"https://1024terabox.com/s/1{clean_code}"
         
-        # We will attempt with loaded cookies first, and retry without cookies if blocked by verification
         initial_cookies = load_cookies()
         attempts = [initial_cookies]
-        # Only add a retry without cookies if we actually have cookies to test with initially
         if initial_cookies:
             attempts.append({})
             
         for idx, cookies_to_send in enumerate(attempts):
             is_last_attempt = (idx == len(attempts) - 1)
             try:
-                # Use unified proxy with mode=resolve for automatic token extraction and API call
                 connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
                 async with aiohttp.ClientSession(connector=connector, cookies=cookies_to_send, headers=headers) as session:
                     params = {
                         "mode": PROXY_MODE_RESOLVE,
-                        "surl": surl,
-                        "raw": "1",  # Get raw upstream response instead of simplified format
+                        "surl": clean_code,
+                        "raw": "1",
                     }
                     if password:
                         params["pwd"] = password
                     
-                    logging.info(f"Fetching file list from unified proxy (mode=resolve, attempt={idx+1}): {PROXY_BASE_URL}")
+                    log_sanitized_stage_diagnostics(
+                        stage="share_session_creation",
+                        endpoint_path=PROXY_BASE_URL,
+                        http_status="PENDING",
+                        cookies=cookies_to_send,
+                        verification_url=verification_link,
+                    )
                     
                     async with request_with_retry(session, "GET", PROXY_BASE_URL, params=params) as response:
-                        # Handle non-200 responses
                         if response.status != 200:
                             error_text = await response.text()
-                            logging.error(f"Proxy returned {response.status}: {error_text}")
                             
                             should_retry = False
                             try:
@@ -97,201 +139,234 @@ async def fetch_download_link(
                                         or "verification" in upstream_msg.lower()
                                     ):
                                         if not is_last_attempt:
-                                            logging.warning("Upstream returned verification requirement with cookies. Retrying without cookies.")
+                                            logger.warning("Upstream returned verification requirement with cookies. Retrying without cookies.")
                                             should_retry = True
                                         else:
+                                            log_sanitized_stage_diagnostics(
+                                                stage="provider_resolution",
+                                                endpoint_path=PROXY_BASE_URL,
+                                                http_status=response.status,
+                                                errno=upstream_errno or 400210,
+                                                errmsg=upstream_msg,
+                                                cookies=cookies_to_send,
+                                                verification_url=verification_link,
+                                                interactive_verification=True,
+                                            )
                                             return {
+                                                "status": "error",
                                                 "error": "provider_verification_required",
                                                 "errno": upstream_errno or 400210,
-                                                "message": "This link requires interactive or captcha verification from the provider",
-                                                "surl": surl,
+                                                "message": upstream_msg or "This link requires interactive or captcha verification from the provider",
+                                                "surl": clean_code,
                                                 "requires_verification": True,
                                                 "requires_password": bool(upstream_errno in (4000020, 400141)),
+                                                "verification_url": verification_link,
+                                                "stage": "provider_resolution",
                                             }
                             except Exception as e:
-                                logging.debug(f"Failed to parse error response JSON: {e}")
+                                logger.debug(f"Failed to parse error response JSON: {e}")
                             
                             if should_retry:
                                 continue
                             
-                            # Check if error indicates verification challenge
                             if "verification" in error_text.lower() or "verify" in error_text.lower():
+                                log_sanitized_stage_diagnostics(
+                                    stage="provider_resolution",
+                                    endpoint_path=PROXY_BASE_URL,
+                                    http_status=response.status,
+                                    errno=400210,
+                                    errmsg="Verification challenge encountered",
+                                    cookies=cookies_to_send,
+                                    verification_url=verification_link,
+                                    interactive_verification=True,
+                                )
                                 return {
+                                    "status": "error",
                                     "error": "provider_verification_required",
                                     "errno": 400210,
                                     "message": "Provider verification challenge encountered",
-                                    "surl": surl,
+                                    "surl": clean_code,
                                     "requires_verification": True,
                                     "requires_password": False,
+                                    "verification_url": verification_link,
+                                    "stage": "provider_resolution",
                                 }
                             
+                            log_sanitized_stage_diagnostics(
+                                stage="provider_resolution",
+                                endpoint_path=PROXY_BASE_URL,
+                                http_status=response.status,
+                                errno=-1,
+                                errmsg=f"Proxy returned {response.status}",
+                                cookies=cookies_to_send,
+                            )
                             return {
-                                "error": f"Proxy error: {response.status}",
+                                "status": "error",
+                                "error": f"proxy_error_{response.status}",
                                 "errno": -1,
                                 "message": f"Upstream proxy returned status {response.status}",
-                                "details": error_text[:200]  # Truncate for logging
+                                "details": error_text[:200],
+                                "stage": "provider_resolution",
                             }
                         
                         response_data = await response.json()
                         
-                        # Check for error response from proxy
                         if "error" in response_data:
                             error_msg = str(response_data.get("error", "Unknown error"))
-                            logging.error(f"Proxy error: {error_msg}")
                             
                             if "verify" in error_msg.lower() or "verification" in error_msg.lower():
+                                log_sanitized_stage_diagnostics(
+                                    stage="provider_resolution",
+                                    endpoint_path=PROXY_BASE_URL,
+                                    http_status=200,
+                                    errno=400210,
+                                    errmsg=error_msg,
+                                    cookies=cookies_to_send,
+                                    verification_url=verification_link,
+                                    interactive_verification=True,
+                                )
                                 return {
+                                    "status": "error",
                                     "error": "provider_verification_required",
                                     "errno": 400210,
                                     "message": "Provider verification required",
-                                    "surl": surl,
+                                    "surl": clean_code,
                                     "requires_verification": True,
                                     "requires_password": False,
+                                    "verification_url": verification_link,
+                                    "stage": "provider_resolution",
                                 }
                             
-                            # Check if this is a token extraction failure (may need cookies)
                             if "jsToken" in error_msg or "cookie" in error_msg.lower():
                                 return {
+                                    "status": "error",
                                     "error": "token_extraction_failed",
                                     "errno": -1,
                                     "message": "Failed to extract authentication tokens. Provider may require verification or cookies.",
+                                    "stage": "provider_resolution",
                                 }
                             
                             return {
+                                "status": "error",
                                 "error": error_msg,
                                 "errno": -1,
                                 "message": error_msg,
+                                "stage": "provider_resolution",
                             }
                         
-                        # With raw=1, the response format is: {"source": "live", "upstream": {...}}
-                        # Extract the actual TeraBox API response from upstream
                         if "upstream" in response_data:
                             api_response = response_data["upstream"]
-                            logging.info(f"Proxy response source: {response_data.get('source', 'unknown')}")
                         else:
-                            # Fallback for other formats
                             api_response = response_data.get("data", response_data)
                         
-                        # Handle TeraBox API errors
                         errno = api_response.get("errno", -1)
                         errmsg = str(api_response.get("errmsg", ""))
-                        logging.info(f"Response errno: {errno}")
                         
-                        # Handle verification required
                         if (
                             errno in (400141, 4000020, 400210, 400310)
                             or "need verify" in errmsg.lower()
                             or "verify_v2" in errmsg.lower()
                         ):
                             if not is_last_attempt:
-                                logging.warning(f"Upstream returned errno {errno} with cookies. Retrying without cookies.")
+                                logger.warning(f"Upstream returned errno {errno} with cookies. Retrying without cookies.")
                                 continue
                             
-                            logging.warning(f"Link requires verification (errno: {errno}, errmsg: {errmsg})")
+                            log_sanitized_stage_diagnostics(
+                                stage="provider_resolution",
+                                endpoint_path=PROXY_BASE_URL,
+                                http_status=200,
+                                errno=errno,
+                                errmsg=errmsg,
+                                cookies=cookies_to_send,
+                                verification_url=verification_link,
+                                interactive_verification=True,
+                            )
                             return {
+                                "status": "error",
                                 "error": "provider_verification_required",
                                 "errno": errno,
                                 "message": errmsg or "This link requires password or captcha verification",
-                                "surl": surl,
+                                "surl": clean_code,
                                 "requires_verification": True,
                                 "requires_password": bool(errno in (400141, 4000020)),
+                                "verification_url": verification_link,
+                                "stage": "provider_resolution",
                             }
                         
-                        # Handle other errors
                         if errno != 0:
                             error_msg = errmsg or "Unknown error"
-                            logging.error(f"API error {errno}: {error_msg}")
-                            return {"error": "provider_error", "errno": errno, "message": error_msg}
+                            log_sanitized_stage_diagnostics(
+                                stage="provider_resolution",
+                                endpoint_path=PROXY_BASE_URL,
+                                http_status=200,
+                                errno=errno,
+                                errmsg=error_msg,
+                                cookies=cookies_to_send,
+                            )
+                            return {
+                                "status": "error",
+                                "error": "provider_error",
+                                "errno": errno,
+                                "message": error_msg,
+                                "stage": "provider_resolution",
+                            }
                         
-                        # Check if we got the file list
                         if "list" not in api_response:
-                            logging.error(f"No file list in response. Response keys: {list(api_response.keys())}")
-                            return {"error": "no_files_found", "errno": -1, "message": "No file list returned by provider"}
+                            return {
+                                "status": "error",
+                                "error": "no_files_found",
+                                "errno": -1,
+                                "message": "No file list returned by provider",
+                                "stage": "provider_resolution",
+                            }
                         
                         files = api_response["list"]
-                        logging.info(f"Found {len(files)} items")
-                        
-                        # If it's a directory (only in full API format), fetch its contents
-                        if files and files[0].get("isdir") == "1":
-                            logging.info("Fetching directory contents")
-                            
-                            # For directory contents, we need to use the API mode with additional parameters
-                            # Extract necessary tokens from the initial response if available
-                            js_token = api_response.get("jsToken")
-                            log_id = api_response.get("dplogid")
-                            
-                            if not js_token:
-                                logging.warning("No jsToken in response for directory listing, returning folder info only")
-                                result_files = FileList(files)
-                                result_files.fallback_no_cookie = (idx > 0)
-                                result_files.used_cookies = (idx == 0 and bool(cookies_to_send))
-                                return result_files
-                            
-                            # Use mode=api for directory contents with the jsToken
-                            from .config import PROXY_MODE_API
-                            
-                            dir_params = {
-                                "mode": PROXY_MODE_API,
-                                "jsToken": js_token,
-                                "shorturl": surl,
-                                "dir": files[0]["path"],
-                                "order": "asc",
-                                "by": "name",
-                            }
-                            if log_id:
-                                dir_params["dplogid"] = log_id
-                            if password:
-                                dir_params["pwd"] = password
-                            
-                            async with request_with_retry(session, "GET", PROXY_BASE_URL, params=dir_params) as dir_response:
-                                if dir_response.status != 200:
-                                    logging.warning("Failed to fetch directory contents, returning folder info")
-                                    result_files = FileList(files)
-                                    result_files.fallback_no_cookie = (idx > 0)
-                                    result_files.used_cookies = (idx == 0 and bool(cookies_to_send))
-                                    return result_files
-                                
-                                dir_data = await dir_response.json()
-                                
-                                # Handle wrapped response for directory listing too
-                                if "data" in dir_data:
-                                    dir_data = dir_data["data"]
-                                
-                                if "list" in dir_data and dir_data.get("errno") == 0:
-                                    files = dir_data["list"]
-                                    logging.info(f"Found {len(files)} files in directory")
-                                else:
-                                    logging.warning("Failed to parse directory contents, returning folder info")
+                        log_sanitized_stage_diagnostics(
+                            stage="metadata_resolution",
+                            endpoint_path=PROXY_BASE_URL,
+                            http_status=200,
+                            errno=0,
+                            errmsg="SUCCESS",
+                            cookies=cookies_to_send,
+                            js_token=api_response.get("jsToken"),
+                            dp_log_id=api_response.get("dplogid"),
+                        )
                         
                         result_files = FileList(files)
                         result_files.fallback_no_cookie = (idx > 0)
                         result_files.used_cookies = (idx == 0 and bool(cookies_to_send))
                         return result_files
+                        
             except Exception as e:
-                logging.error(f"Error on attempt {idx+1}: {e}", exc_info=True)
+                logger.error(f"Error on attempt {idx+1}: {e}", exc_info=True)
                 if is_last_attempt:
-                    return {"error": str(e), "errno": -1}
+                    return {
+                        "status": "error",
+                        "error": "connection_error",
+                        "errno": -1,
+                        "message": str(e),
+                        "stage": "provider_resolution",
+                    }
                     
     except Exception as e:
-        logging.error(f"Unexpected error: {e}", exc_info=True)
-        return {"error": str(e), "errno": -1}
+        logger.error(f"Unexpected error in fetch_download_link: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "error": "internal_error",
+            "errno": -1,
+            "message": str(e),
+            "stage": "provider_resolution",
+        }
 
 
 async def format_file_info(file_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Format file information for API response.
-    
-    Args:
-        file_data: Raw file data from TeraBox API
-        
-    Returns:
-        Dict[str, Any]: Formatted file information
-    """
+    """Format file information for API response."""
     thumbnails = {}
     if "thumbs" in file_data:
-        for key, url in file_data["thumbs"].items():
-            if url:
-                dimensions = extract_thumbnail_dimensions(url)
-                thumbnails[dimensions] = url
+        for key, thumb_url in file_data["thumbs"].items():
+            if thumb_url:
+                dimensions = extract_thumbnail_dimensions(thumb_url)
+                thumbnails[dimensions] = thumb_url
 
     return {
         "filename": file_data.get("server_filename", "Unknown"),
@@ -308,17 +383,16 @@ async def format_file_info(file_data: Dict[str, Any]) -> Dict[str, Any]:
 async def fetch_direct_links(
     url: str, password: str = "", files: Optional[List[Dict[str, Any]]] = None
 ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
-    """Fetch files with direct download links (alternative method).
+    """Fetch files with direct download links.
     
     Args:
         url: TeraBox share URL
         password: Optional password for protected links
-        files: Optional list of files already fetched from cache or API
+        files: Optional list of files already fetched
         
     Returns:
         Union[List[Dict[str, Any]], Dict[str, Any]]: List of files with direct links or error dict
     """
-
     try:
         if files is None:
             files = await fetch_download_link(url, password)
@@ -326,9 +400,7 @@ async def fetch_direct_links(
         if isinstance(files, dict) and "error" in files:
             return files
 
-        # Load cookies for the session (previous code referenced undefined `cookies`)
         session_cookies = load_cookies()
-
         connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
         async with aiohttp.ClientSession(
             connector=connector,
@@ -341,59 +413,63 @@ async def fetch_direct_links(
                 results.fallback_no_cookie = files.fallback_no_cookie
             if hasattr(files, "used_cookies"):
                 results.used_cookies = files.used_cookies
+
             for item in files or []:
-                # Ensure each item is a dict; skip otherwise
-
                 if not isinstance(item, dict):
-                    logging.warning(f"Skipping non-dict item in files: {type(item)}")
-
                     continue
 
-                # Get direct link by following redirect
+                dlink = item.get("dlink") or item.get("download_link") or item.get("link") or ""
+                direct_link = item.get("direct_link")
 
-                dlink = item.get("dlink") or ""
-                logging.info(f"Direct link: {dlink}")
-
-                direct_link = None
-
-                if dlink:
+                if dlink and not direct_link:
                     try:
                         async with request_with_retry(
                             session, "HEAD", dlink, allow_redirects=False
                         ) as response:
-                            direct_link = response.headers.get("Location")
-
+                            direct_link = response.headers.get("Location") or str(response.url)
                     except Exception as e:
-                        logging.error(f"Error getting direct link: {e}")
+                        logger.error(f"Error resolving direct CDN link: {e}")
+                        direct_link = dlink
+
+                final_direct = direct_link or dlink or None
+
+                log_sanitized_stage_diagnostics(
+                    stage="direct_link_resolution",
+                    endpoint_path=dlink[:30] if dlink else "none",
+                    http_status=200 if final_direct else "NO_DIRECT_LINK",
+                    errno=0 if final_direct else -1,
+                    errmsg="SUCCESS" if final_direct else "No direct link returned",
+                    cookies=session_cookies,
+                )
 
                 results.append(
                     {
-                        "filename": item.get("server_filename", "Unknown"),
-                        "size": get_formatted_size(item.get("size", 0)),
-                        "size_bytes": item.get("size", 0),
+                        "filename": item.get("server_filename") or item.get("filename", "Unknown"),
+                        "size": get_formatted_size(item.get("size", item.get("size_bytes", 0))),
+                        "size_bytes": item.get("size_bytes", item.get("size", 0)),
                         "link": dlink,
-                        "direct_link": direct_link,
-                        "thumbnail": (item.get("thumbs") or {}).get("url3", ""),
+                        "download_link": final_direct or dlink,
+                        "direct_link": final_direct,
+                        "thumbnail": (item.get("thumbs") or {}).get("url3", "") or item.get("thumbnail", ""),
+                        "fs_id": item.get("fs_id", ""),
                     }
                 )
 
             return results
 
     except Exception as e:
-        logging.error(f"Error in fetch_direct_links: {e}")
-
-        return {"error": str(e), "errno": -1}
+        logger.exception(f"Error in fetch_direct_links: {e}")
+        return {
+            "status": "error",
+            "error": "direct_link_error",
+            "message": str(e),
+            "errno": -1,
+            "stage": "direct_link_resolution",
+        }
 
 
 async def _gather_format_file_info(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Helper to run format_file_info concurrently for a list of file dicts.
-    
-    Args:
-        files: List of file data dictionaries
-        
-    Returns:
-        List[Dict[str, Any]]: List of formatted file information
-    """
+    """Helper to run format_file_info concurrently."""
     tasks = [format_file_info(item) for item in files if isinstance(item, dict)]
     if not tasks:
         return []
@@ -402,14 +478,7 @@ async def _gather_format_file_info(files: List[Dict[str, Any]]) -> List[Dict[str
 
 
 async def _normalize_api2_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Normalize items returned by fetch_direct_links to the /api response shape.
-    
-    Args:
-        items: List of items from fetch_direct_links
-        
-    Returns:
-        List[Dict[str, Any]]: Normalized list of file information
-    """
+    """Normalize items returned by fetch_direct_links to the /api response shape."""
     out = FileList()
     if hasattr(items, "fallback_no_cookie"):
         out.fallback_no_cookie = items.fallback_no_cookie
@@ -423,7 +492,7 @@ async def _normalize_api2_items(items: List[Dict[str, Any]]) -> List[Dict[str, A
             size_h = (
                 item.get("size")
                 if isinstance(item.get("size"), str)
-                else get_formatted_size(item.get("size", 0))
+                else get_formatted_size(item.get("size_bytes", item.get("size", 0)))
             )
             size_b = item.get("size_bytes", item.get("size", 0))
             download = (
