@@ -331,6 +331,101 @@ def test_session_isolation_between_requests(mock_download, client):
     assert r2.get_json()["files"][0]["filename"] == "userB.mp4" 
 
 
+# Scenario 12: Dedicated verification session creation endpoint
+@patch("terabox_gateway.api.fetch_download_link", new_callable=AsyncMock)
+def test_create_verification_session_endpoint(mock_download, client):
+    mock_download.return_value = {
+        "status": "error",
+        "error": "provider_verification_required",
+        "errno": 400210,
+        "message": "need verify_v2",
+        "surl": "fKvukFFlwMqHt3vbdFoRYQ",
+        "requires_verification": True,
+        "verification_url": "https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ",
+        "stage": "provider_resolution",
+    }
+
+    resp = client.post("/api/verification/session", json={"url": "https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ"})
+    assert resp.status_code == 409
+    data = resp.get_json()
+    assert data["status"] == "verification_required"
+    assert "session_id" in data
+    assert data["verification_url"] == "https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ"
+    assert data["requires_verification"] is True
+
+
+# Scenario 13: Verification complete retry - success case
+@patch("terabox_gateway.api.fetch_download_link", new_callable=AsyncMock)
+@patch("terabox_gateway.api.fetch_direct_links", new_callable=AsyncMock)
+def test_verification_complete_success_flow(mock_direct, mock_download, client):
+    from terabox_gateway.session_store import session_store
+    
+    # 1. Create active session
+    session = session_store.create_session(
+        url="https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ",
+        surl="fKvukFFlwMqHt3vbdFoRYQ",
+        verification_url="https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ",
+        files=[{"server_filename": "video.mp4", "size": 8108680, "fs_id": "1"}],
+    )
+
+    # 2. Mock direct link success
+    mock_direct_files = FileList([
+        {
+            "filename": "video.mp4",
+            "size_bytes": 8108680,
+            "download_link": "https://d.terabox.app/download/video.mp4",
+            "direct_link": "https://d.terabox.app/direct/video.mp4",
+            "fs_id": "1",
+        }
+    ])
+    mock_direct.return_value = mock_direct_files
+
+    # 3. Call complete
+    resp = client.post("/api/verification/complete", json={"session_id": session.session_id})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["status"] == "success"
+    assert data["session_id"] == session.session_id
+    assert len(data["files"]) == 1
+    assert data["files"][0]["direct_link"] == "https://d.terabox.app/direct/video.mp4"
+
+
+# Scenario 14: Verification complete retry - still requires verification
+@patch("terabox_gateway.api.fetch_direct_links", new_callable=AsyncMock)
+def test_verification_complete_still_requires_verification(mock_direct, client):
+    from terabox_gateway.session_store import session_store
+    
+    session = session_store.create_session(
+        url="https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ",
+        surl="fKvukFFlwMqHt3vbdFoRYQ",
+        verification_url="https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ",
+    )
+
+    mock_direct.return_value = {
+        "status": "error",
+        "error": "provider_verification_required",
+        "errno": 400210,
+        "message": "need verify_v2",
+        "requires_verification": True,
+    }
+
+    resp = client.post("/api/verification/complete", json={"session_id": session.session_id})
+    assert resp.status_code == 409
+    data = resp.get_json()
+    assert data["status"] == "error"
+    assert data["error"] == "provider_verification_required"
+    assert data["requires_verification"] is True
+
+
+# Scenario 15: Verification complete on expired session
+def test_verification_complete_expired_session(client):
+    resp = client.post("/api/verification/complete", json={"session_id": "nonexistent_or_expired_id"})
+    assert resp.status_code == 410
+    data = resp.get_json()
+    assert data["status"] == "error"
+    assert data["error"] == "verification_expired"
+
+
 def test_cors_headers(client):
     response = client.get("/health")
     assert response.headers.get("Access-Control-Allow-Origin") == "*"

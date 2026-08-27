@@ -33,6 +33,7 @@ from .terabox_client import (
     fetch_direct_links,
     _normalize_api2_items,
 )
+from .session_store import session_store, is_valid_direct_download_url
 from .rate_limiter import rate_limit
 from . import cache
 
@@ -303,6 +304,20 @@ async def api():
                 or "verify" in str(link_data.get("message", "")).lower()
                 or "verify" in str(err_type).lower()
             )
+            v_url = link_data.get("verification_url") or url
+            surl = link_data.get("surl", "")
+            
+            session_id = None
+            if is_verification:
+                session = session_store.create_session(
+                    url=url,
+                    surl=surl,
+                    verification_url=v_url,
+                    password=password,
+                    challenge_state={"errno": err_code, "errmsg": link_data.get("message")},
+                )
+                session_id = session.session_id
+
             if link_data.get("requires_password"):
                 status_code = 400
             elif is_verification:
@@ -312,21 +327,21 @@ async def api():
             else:
                 status_code = 502
 
-            return (
-                jsonify(
-                    {
-                        "status": "error",
-                        "error": "provider_verification_required" if is_verification else err_type,
-                        "errno": err_code,
-                        "message": link_data.get("message") or link_data.get("error") or "Provider resolution failed",
-                        "requires_verification": is_verification,
-                        "requires_password": link_data.get("requires_password", False),
-                        "verification_url": link_data.get("verification_url") or (url if is_verification else None),
-                        "stage": "provider_resolution",
-                    }
-                ),
-                status_code,
-            )
+            err_resp = {
+                "status": "error",
+                "error": "provider_verification_required" if is_verification else err_type,
+                "errno": err_code,
+                "message": link_data.get("message") or link_data.get("error") or "Provider resolution failed",
+                "requires_verification": is_verification,
+                "requires_password": link_data.get("requires_password", False),
+                "verification_url": v_url if is_verification else None,
+                "stage": "provider_resolution",
+            }
+            if session_id:
+                err_resp["session_id"] = session_id
+                err_resp["verification_transfer_supported"] = False  # TeraBox browser CAPTCHAs are bound to browser cookies/IP
+
+            return jsonify(err_resp), status_code
 
         if not link_data:
             return (
@@ -356,22 +371,35 @@ async def api():
                     or "verify" in str(resolved_data.get("message", "")).lower()
                     or "verify" in str(err_type).lower()
                 )
+                v_url = resolved_data.get("verification_url") or url
+                session_id = None
+                if is_verification:
+                    session = session_store.create_session(
+                        url=url,
+                        surl="",
+                        verification_url=v_url,
+                        password=password,
+                        challenge_state={"errno": err_code, "errmsg": resolved_data.get("message")},
+                    )
+                    session_id = session.session_id
+
                 status_code = 400 if resolved_data.get("requires_password") else (409 if is_verification else 502)
-                return (
-                    jsonify(
-                        {
-                            "status": "error",
-                            "error": "provider_verification_required" if is_verification else err_type,
-                            "errno": err_code,
-                            "message": resolved_data.get("message") or resolved_data.get("error") or "Direct link resolution failed",
-                            "requires_verification": is_verification,
-                            "requires_password": resolved_data.get("requires_password", False),
-                            "verification_url": resolved_data.get("verification_url") or (url if is_verification else None),
-                            "stage": "direct_link_resolution",
-                        }
-                    ),
-                    status_code,
-                )
+                err_resp = {
+                    "status": "error",
+                    "error": "provider_verification_required" if is_verification else err_type,
+                    "errno": err_code,
+                    "message": resolved_data.get("message") or resolved_data.get("error") or "Direct link resolution failed",
+                    "requires_verification": is_verification,
+                    "requires_password": resolved_data.get("requires_password", False),
+                    "verification_url": v_url if is_verification else None,
+                    "stage": "direct_link_resolution",
+                }
+                if session_id:
+                    err_resp["session_id"] = session_id
+                    err_resp["verification_transfer_supported"] = False
+
+                return jsonify(err_resp), status_code
+
             formatted_files = await _normalize_api2_items(resolved_data)
         else:
             formatted_files = await _normalize_api2_items(link_data)
@@ -405,6 +433,193 @@ async def api():
             ),
             500,
         )
+
+
+@app.route("/api/verification/session", methods=["GET", "POST"])
+@rate_limit
+async def create_verification_session_route():
+    """Create or initialize a server-side resolver session for a share link."""
+    try:
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            url = data.get("url") or request.args.get("url")
+            password = data.get("pwd") or data.get("password") or request.args.get("pwd", "")
+        else:
+            url = request.args.get("url")
+            password = request.args.get("pwd", "")
+
+        if not url:
+            return jsonify({
+                "status": "error",
+                "error": "missing_parameter",
+                "message": "Missing required parameter: url",
+                "stage": "parameter_validation"
+            }), 400
+
+        if not is_valid_share_url(url):
+            return jsonify({
+                "status": "error",
+                "error": "invalid_url",
+                "message": "Invalid TeraBox share URL",
+                "stage": "parameter_validation"
+            }), 400
+
+        link_data = await fetch_download_link(url, password)
+        
+        if isinstance(link_data, dict) and "error" in link_data:
+            err_code = link_data.get("errno")
+            err_type = link_data.get("error", "provider_error")
+            is_verification = (
+                link_data.get("requires_verification", False)
+                or err_code in (400210, 400310, 400141, 4000020)
+                or "verify" in str(link_data.get("message", "")).lower()
+                or "verify" in str(err_type).lower()
+            )
+            v_url = link_data.get("verification_url") or url
+            surl = link_data.get("surl", "")
+            
+            session = session_store.create_session(
+                url=url,
+                surl=surl,
+                verification_url=v_url,
+                password=password,
+                challenge_state={"errno": err_code, "errmsg": link_data.get("message")},
+            )
+            
+            return jsonify({
+                "status": "verification_required",
+                "session_id": session.session_id,
+                "verification_url": session.verification_url,
+                "requires_verification": True,
+                "expires_in_seconds": session.time_remaining_seconds(),
+                "stage": "verification_session_created"
+            }), 409
+
+        # If metadata is already resolved:
+        session = session_store.create_session(
+            url=url,
+            surl="",
+            verification_url=url,
+            password=password,
+            files=link_data if isinstance(link_data, list) else None,
+        )
+        return jsonify({
+            "status": "ready",
+            "session_id": session.session_id,
+            "requires_verification": False,
+            "files": await _normalize_api2_items(link_data) if isinstance(link_data, list) else [],
+            "stage": "share_metadata_success"
+        }), 200
+
+    except Exception as e:
+        logger.exception(f"Error in /api/verification/session: {e}")
+        return jsonify({
+            "status": "error",
+            "error": "internal_error",
+            "message": "An unexpected error occurred creating verification session",
+            "stage": "resolver_execution"
+        }), 500
+
+
+@app.route("/api/verification/complete", methods=["POST"])
+@rate_limit
+async def verification_complete_route():
+    """Controlled retry endpoint to resume direct link resolution with an authorized session."""
+    try:
+        data = request.get_json(silent=True) or {}
+        session_id = data.get("session_id") or request.args.get("session_id")
+        
+        if not session_id:
+            return jsonify({
+                "status": "error",
+                "error": "missing_parameter",
+                "message": "Missing required parameter: session_id",
+                "stage": "parameter_validation"
+            }), 400
+            
+        session = session_store.get_session(session_id)
+        if not session:
+            logger.info(f"[TeraBox Diagnostics] stage=verification_expired sessionId={session_id[:8]}***")
+            return jsonify({
+                "status": "error",
+                "error": "verification_expired",
+                "message": "Verification session has expired or does not exist",
+                "stage": "verification_expired"
+            }), 410
+
+        logger.info(f"[TeraBox Diagnostics] stage=direct_link_resolution_started sessionId={session_id[:8]}***")
+        
+        resolved_data = await fetch_direct_links(session.url, session.password, files=session.files)
+        
+        if isinstance(resolved_data, dict) and "error" in resolved_data:
+            err_code = resolved_data.get("errno")
+            err_type = resolved_data.get("error", "direct_link_error")
+            is_verification = (
+                resolved_data.get("requires_verification", False)
+                or err_code in (400210, 400310, 400141, 4000020)
+                or "verify" in str(resolved_data.get("message", "")).lower()
+                or "verify" in str(err_type).lower()
+            )
+            if is_verification:
+                logger.info(f"[TeraBox Diagnostics] stage=provider_verification_required sessionId={session_id[:8]}***")
+                return jsonify({
+                    "status": "error",
+                    "error": "provider_verification_required",
+                    "errno": err_code or 400210,
+                    "session_id": session_id,
+                    "verification_url": session.verification_url,
+                    "requires_verification": True,
+                    "message": "TeraBox provider verification is still required or was not transferred",
+                    "stage": "provider_verification_required"
+                }), 409
+                
+            return jsonify({
+                "status": "error",
+                "error": err_type,
+                "errno": err_code,
+                "session_id": session_id,
+                "message": resolved_data.get("message") or resolved_data.get("error"),
+                "stage": "direct_link_resolution_failed"
+            }), 502
+
+        formatted_files = await _normalize_api2_items(resolved_data)
+        
+        has_direct_url = False
+        if formatted_files and len(formatted_files) > 0:
+            first_file = formatted_files[0]
+            d_link = first_file.get("direct_link") or first_file.get("download_link")
+            if is_valid_direct_download_url(d_link):
+                has_direct_url = True
+
+        if has_direct_url:
+            session_store.update_session(session_id, verification_state="completed")
+            logger.info(f"[TeraBox Diagnostics] stage=direct_link_resolution_success sessionId={session_id[:8]}*** directLinkPresent=YES")
+            return jsonify({
+                "status": "success",
+                "session_id": session_id,
+                "url": session.url,
+                "files": formatted_files,
+                "total_files": len(formatted_files),
+                "stage": "direct_link_resolution_success"
+            }), 200
+        else:
+            logger.info(f"[TeraBox Diagnostics] stage=direct_link_resolution_failed sessionId={session_id[:8]}*** directLinkPresent=NO")
+            return jsonify({
+                "status": "error",
+                "error": "direct_link_resolution_failed",
+                "session_id": session_id,
+                "message": "No direct download link was returned by the provider",
+                "stage": "direct_link_resolution_failed"
+            }), 422
+            
+    except Exception as e:
+        logger.exception(f"Error in /api/verification/complete: {e}")
+        return jsonify({
+            "status": "error",
+            "error": "internal_error",
+            "message": "An unexpected error occurred during verification retry",
+            "stage": "resolver_execution"
+        }), 500
 
 
 @app.route("/admin/<path:subpath>", methods=["GET"])
