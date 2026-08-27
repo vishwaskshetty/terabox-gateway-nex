@@ -1,7 +1,5 @@
 Flask[async]>=3.1,<4
 Werkzeug>=3.1,<4
 aiohttp>=3.8,<4
-# Optional deps for production servers or CORS
-# hypercorn>=0.14
-# waitress>=2.1
-# Flask-Cors>=4,<5
+gunicorn>=21.2.0; sys_platform != 'win32'
+
