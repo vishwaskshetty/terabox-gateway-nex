@@ -35,6 +35,14 @@ def test_api_invalid_mode(client):
     data = response.get_json()
     assert data["error"] == "Invalid mode"
 
+def test_api_invalid_url(client):
+    response = client.get("/api?url=https://example.com/s/12345")
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data["status"] == "error"
+    assert "Invalid TeraBox share URL" in data["message"]
+
 def test_cors_headers(client):
     response = client.get("/health")
     assert response.headers.get("Access-Control-Allow-Origin") == "*"
+

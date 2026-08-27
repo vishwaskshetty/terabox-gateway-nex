@@ -26,12 +26,18 @@ ALLOWED_HOSTS: set[str] = {
     "www.terabox.com",
     "1024terabox.com",
     "www.1024terabox.com",
+    "1024tera.com",
+    "www.1024tera.com",
     "teraboxlink.com",
     "terasharefile.com",
     "terafileshare.com",
     "terasharelink.com",
-    "teraboxshare.com",
-    "www.teraboxshare.com"
+    "mirrobox.com",
+    "nephobox.com",
+    "4funbox.com",
+    "freeterabox.com",
+    "momole.com",
+    "gibox.com",
 }
 
 
