@@ -118,6 +118,11 @@ def index():
     )
 
 
+from urllib.parse import urlparse
+
+logger = logging.getLogger("terabox_gateway")
+
+
 @app.route("/api", methods=["GET"])
 @rate_limit
 async def api():
@@ -126,6 +131,21 @@ async def api():
         start_time = time.time()
         mode = request.args.get("mode")
         url = request.args.get("url")
+        resolve = request.args.get("resolve", "0") in ("1", "true", "True")
+
+        # Safe request logging (never logs sensitive query/auth data)
+        sanitized_host = "none"
+        if url:
+            try:
+                sanitized_host = urlparse(url).netloc or "invalid"
+            except Exception:
+                sanitized_host = "invalid"
+
+        logger.info(
+            f"[API Request] method={request.method} path={request.path} "
+            f"hasUrl={'YES' if url else 'NO'} hasResolve={'YES' if resolve else 'NO'} "
+            f"targetHost={sanitized_host} mode={mode or 'none'}"
+        )
         
         # ===== PROXY MODE LOGIC =====
         if mode:
@@ -143,9 +163,11 @@ async def api():
             
             if mode not in valid_modes:
                 return jsonify({
-                    "error": "Invalid mode",
+                    "status": "error",
+                    "error": "invalid_mode",
+                    "message": f"Invalid mode '{mode}'",
                     "allowed": valid_modes,
-                    "provided": mode
+                    "stage": "parameter_validation"
                 }), 400
             
             # Build proxy request parameters
@@ -159,25 +181,25 @@ async def api():
             # Validate required parameters based on mode
             if mode == PROXY_MODE_RESOLVE:
                 if "surl" not in params:
-                    return jsonify({"error": "Missing required parameter: surl"}), 400
+                    return jsonify({"status": "error", "error": "missing_parameter", "message": "Missing required parameter: surl", "stage": "parameter_validation"}), 400
             elif mode == PROXY_MODE_LOOKUP:
                 if "surl" not in params and "fid" not in params:
-                    return jsonify({"error": "Missing required parameter: surl or fid"}), 400
+                    return jsonify({"status": "error", "error": "missing_parameter", "message": "Missing required parameter: surl or fid", "stage": "parameter_validation"}), 400
             elif mode == PROXY_MODE_PAGE:
                 if "surl" not in params:
-                    return jsonify({"error": "Missing required parameter: surl"}), 400
+                    return jsonify({"status": "error", "error": "missing_parameter", "message": "Missing required parameter: surl", "stage": "parameter_validation"}), 400
             elif mode == PROXY_MODE_API:
                 if "jsToken" not in params or "shorturl" not in params:
-                    return jsonify({"error": "Missing required parameters: jsToken and shorturl"}), 400
+                    return jsonify({"status": "error", "error": "missing_parameter", "message": "Missing required parameters: jsToken and shorturl", "stage": "parameter_validation"}), 400
             elif mode == PROXY_MODE_STREAM:
                 if "surl" not in params:
-                    return jsonify({"error": "Missing required parameter: surl"}), 400
+                    return jsonify({"status": "error", "error": "missing_parameter", "message": "Missing required parameter: surl", "stage": "parameter_validation"}), 400
             elif mode == PROXY_MODE_SEGMENT:
                 if "url" not in params:
-                    return jsonify({"error": "Missing required parameter: url"}), 400
+                    return jsonify({"status": "error", "error": "missing_parameter", "message": "Missing required parameter: url", "stage": "parameter_validation"}), 400
             elif mode == PROXY_MODE_THUMBNAIL:
                 if "fid" not in params:
-                    return jsonify({"error": "Missing required parameter: fid"}), 400
+                    return jsonify({"status": "error", "error": "missing_parameter", "message": "Missing required parameter: fid", "stage": "parameter_validation"}), 400
             elif mode == PROXY_MODE_HEALTH:
                 pass
             
@@ -206,7 +228,7 @@ async def api():
             result = await _proxy_request(PROXY_BASE_URL, params, cookies, req_headers=req_headers)
             
             if "error" in result:
-                return jsonify(result), result.get("status_code", 500)
+                return jsonify(result), result.get("status_code", 502)
             
             # Return response with appropriate content type, filtering out transport/encoding headers
             excluded_headers = {
@@ -228,15 +250,17 @@ async def api():
                 content_type=result["content_type"]
             )
         
-        # ===== LEGACY FILE LISTING MODE =====
+        # ===== FILE RESOLVER MODE =====
         if not url:
             return (
                 jsonify(
                     {
                         "status": "error",
+                        "error": "missing_parameter",
                         "message": "Missing required parameter: url or mode",
+                        "stage": "parameter_validation",
                         "examples": {
-                            "file_listing": "/api?url=https://teraboxshare.com/s/...",
+                            "file_listing": "/api?url=https://1024terabox.com/s/...",
                             "proxy_resolve": "/api?mode=resolve&surl=abc123",
                             "proxy_stream": "/api?mode=stream&surl=abc123"
                         }
@@ -250,128 +274,132 @@ async def api():
                 jsonify(
                     {
                         "status": "error",
+                        "error": "invalid_url",
                         "message": "Invalid TeraBox share URL",
-                        "example": "/api?url=https://teraboxshare.com/s/XXXXXXXX",
+                        "stage": "parameter_validation",
+                        "example": "/api?url=https://1024terabox.com/s/XXXXXXXX",
                     }
                 ),
                 400,
             )
 
         password = request.args.get("pwd", "")
-        logging.info(f"API request for URL: {url}")
-
-        resolve = request.args.get("resolve", "0") in ("1", "true", "True")
 
         # Check cache first
         refresh = request.args.get("refresh", "").lower() in ("1", "true")
         cached = None if refresh else cache.get(url, password)
-        if cached is not None:
-            if resolve:
-                resolved_data = await fetch_direct_links(url, password, files=cached)
-                if isinstance(resolved_data, dict) and "error" in resolved_data:
-                    status_code = 400 if resolved_data.get("requires_password") else 500
-                    return (
-                        jsonify(
-                            {
-                                "status": "error",
-                                "url": url,
-                                "error": resolved_data["error"],
-                                "errno": resolved_data.get("errno"),
-                                "message": resolved_data.get("message", ""),
-                                "requires_password": resolved_data.get("requires_password", False),
-                            }
-                        ),
-                        status_code,
-                    )
-                formatted_files = await _normalize_api2_items(resolved_data)
-            else:
-                formatted_files = await _normalize_api2_items(cached)
-            
-            response_time = format_response_time(time.time() - start_time)
-            resp_dict = {
-                "status": "success",
-                "url": url,
-                "files": formatted_files,
-                "total_files": len(formatted_files),
-                "response_time": response_time,
-                "cached": True,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "used_cookies": getattr(formatted_files, "used_cookies", False),
-            }
-            if getattr(formatted_files, "fallback_no_cookie", False):
-                resp_dict["fallback_no_cookie"] = True
-                resp_dict["warning"] = "Cookies were rate-limited or invalid. Resolved anonymously without cookies. Download links may be missing."
-            return jsonify(resp_dict)
+        link_data = cached
 
-        link_data = await fetch_download_link(url, password)
+        if link_data is None:
+            link_data = await fetch_download_link(url, password)
 
-        # Check if error occurred
+        # Check if an error/verification condition occurred
         if isinstance(link_data, dict) and "error" in link_data:
-            status_code = 400 if link_data.get("requires_password") else 500
+            err_code = link_data.get("errno")
+            err_type = link_data.get("error", "provider_error")
+            is_verification = (
+                link_data.get("requires_verification", False)
+                or err_code in (400210, 400310, 400141, 4000020)
+                or "verify" in str(link_data.get("message", "")).lower()
+                or "verify" in str(err_type).lower()
+            )
+            if link_data.get("requires_password"):
+                status_code = 400
+            elif is_verification:
+                status_code = 409
+            elif err_code == -1 and "404" in str(link_data.get("details", "")):
+                status_code = 404
+            else:
+                status_code = 502
+
             return (
                 jsonify(
                     {
                         "status": "error",
-                        "url": url,
-                        "error": link_data["error"],
-                        "errno": link_data.get("errno"),
-                        "message": link_data.get("message", ""),
+                        "error": "provider_verification_required" if is_verification else err_type,
+                        "errno": err_code,
+                        "message": link_data.get("message") or link_data.get("error") or "Provider resolution failed",
+                        "requires_verification": is_verification,
                         "requires_password": link_data.get("requires_password", False),
+                        "stage": "provider_resolution",
                     }
                 ),
                 status_code,
             )
 
-        # Format file information
-        if link_data:
-            cache.put(url, link_data, password)
-            if resolve:
-                resolved_data = await fetch_direct_links(url, password, files=link_data)
-                if isinstance(resolved_data, dict) and "error" in resolved_data:
-                    status_code = 400 if resolved_data.get("requires_password") else 500
-                    return (
-                        jsonify(
-                            {
-                                "status": "error",
-                                "url": url,
-                                "error": resolved_data["error"],
-                                "errno": resolved_data.get("errno"),
-                                "message": resolved_data.get("message", ""),
-                                "requires_password": resolved_data.get("requires_password", False),
-                            }
-                        ),
-                        status_code,
-                    )
-                formatted_files = await _normalize_api2_items(resolved_data)
-            else:
-                formatted_files = await _normalize_api2_items(link_data)
-            response_time = format_response_time(time.time() - start_time)
-
-            resp_dict = {
-                "status": "success",
-                "url": url,
-                "files": formatted_files,
-                "total_files": len(formatted_files),
-                "response_time": response_time,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "used_cookies": getattr(formatted_files, "used_cookies", False),
-            }
-            if getattr(formatted_files, "fallback_no_cookie", False):
-                resp_dict["fallback_no_cookie"] = True
-                resp_dict["warning"] = "Cookies were rate-limited or invalid. Resolved anonymously without cookies. Download links may be missing."
-
-            return jsonify(resp_dict)
-        else:
+        if not link_data:
             return (
-                jsonify({"status": "error", "message": "No files found", "url": url}),
+                jsonify(
+                    {
+                        "status": "error",
+                        "error": "no_files_found",
+                        "message": "No files found for the supplied share link",
+                        "stage": "provider_resolution",
+                    }
+                ),
                 404,
             )
 
+        # Cache raw files
+        cache.put(url, link_data, password)
+
+        # Direct link resolution
+        if resolve:
+            resolved_data = await fetch_direct_links(url, password, files=link_data)
+            if isinstance(resolved_data, dict) and "error" in resolved_data:
+                err_code = resolved_data.get("errno")
+                err_type = resolved_data.get("error", "direct_link_error")
+                is_verification = (
+                    resolved_data.get("requires_verification", False)
+                    or err_code in (400210, 400310, 400141, 4000020)
+                    or "verify" in str(resolved_data.get("message", "")).lower()
+                    or "verify" in str(err_type).lower()
+                )
+                status_code = 400 if resolved_data.get("requires_password") else (409 if is_verification else 502)
+                return (
+                    jsonify(
+                        {
+                            "status": "error",
+                            "error": "provider_verification_required" if is_verification else err_type,
+                            "errno": err_code,
+                            "message": resolved_data.get("message") or resolved_data.get("error") or "Direct link resolution failed",
+                            "requires_verification": is_verification,
+                            "requires_password": resolved_data.get("requires_password", False),
+                            "stage": "direct_link_resolution",
+                        }
+                    ),
+                    status_code,
+                )
+            formatted_files = await _normalize_api2_items(resolved_data)
+        else:
+            formatted_files = await _normalize_api2_items(link_data)
+
+        response_time = format_response_time(time.time() - start_time)
+        resp_dict = {
+            "status": "success",
+            "url": url,
+            "files": formatted_files,
+            "total_files": len(formatted_files),
+            "response_time": response_time,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "used_cookies": getattr(formatted_files, "used_cookies", False),
+        }
+        if getattr(formatted_files, "fallback_no_cookie", False):
+            resp_dict["fallback_no_cookie"] = True
+            resp_dict["warning"] = "Cookies were rate-limited or invalid. Resolved anonymously without cookies. Download links may be missing."
+
+        return jsonify(resp_dict)
+
     except Exception as e:
-        logging.error(f"API error: {e}", exc_info=True)
+        logger.exception(f"Unhandled exception in /api resolver: {e}")
         return (
             jsonify(
-                {"status": "error", "message": str(e), "params": dict(request.args)} 
+                {
+                    "status": "error",
+                    "error": "internal_error",
+                    "message": "An unexpected error occurred during resolution",
+                    "stage": "resolver_execution",
+                }
             ),
             500,
         )

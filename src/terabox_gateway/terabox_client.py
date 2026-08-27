@@ -89,18 +89,24 @@ async def fetch_download_link(
                                 upstream_err = err_json.get("details", {})
                                 if isinstance(upstream_err, dict):
                                     upstream_errno = upstream_err.get("errno")
-                                    upstream_msg = upstream_err.get("errmsg", "")
-                                    if upstream_errno == 4000020 or "need verify" in str(upstream_msg).lower():
+                                    upstream_msg = str(upstream_err.get("errmsg", "") or upstream_err.get("reason", ""))
+                                    if (
+                                        upstream_errno in (4000020, 400141, 400210, 400310)
+                                        or "need verify" in upstream_msg.lower()
+                                        or "verify_v2" in upstream_msg.lower()
+                                        or "verification" in upstream_msg.lower()
+                                    ):
                                         if not is_last_attempt:
-                                            logging.warning("Upstream returned 'need verify' with cookies. Retrying without cookies.")
+                                            logging.warning("Upstream returned verification requirement with cookies. Retrying without cookies.")
                                             should_retry = True
                                         else:
                                             return {
-                                                "error": "Verification required",
-                                                "errno": 4000020,
-                                                "message": "This link requires password or captcha verification",
+                                                "error": "provider_verification_required",
+                                                "errno": upstream_errno or 400210,
+                                                "message": "This link requires interactive or captcha verification from the provider",
                                                 "surl": surl,
-                                                "requires_password": True,
+                                                "requires_verification": True,
+                                                "requires_password": bool(upstream_errno in (4000020, 400141)),
                                             }
                             except Exception as e:
                                 logging.debug(f"Failed to parse error response JSON: {e}")
@@ -108,9 +114,21 @@ async def fetch_download_link(
                             if should_retry:
                                 continue
                             
+                            # Check if error indicates verification challenge
+                            if "verification" in error_text.lower() or "verify" in error_text.lower():
+                                return {
+                                    "error": "provider_verification_required",
+                                    "errno": 400210,
+                                    "message": "Provider verification challenge encountered",
+                                    "surl": surl,
+                                    "requires_verification": True,
+                                    "requires_password": False,
+                                }
+                            
                             return {
                                 "error": f"Proxy error: {response.status}",
                                 "errno": -1,
+                                "message": f"Upstream proxy returned status {response.status}",
                                 "details": error_text[:200]  # Truncate for logging
                             }
                         
@@ -118,20 +136,31 @@ async def fetch_download_link(
                         
                         # Check for error response from proxy
                         if "error" in response_data:
-                            error_msg = response_data.get("error", "Unknown error")
+                            error_msg = str(response_data.get("error", "Unknown error"))
                             logging.error(f"Proxy error: {error_msg}")
+                            
+                            if "verify" in error_msg.lower() or "verification" in error_msg.lower():
+                                return {
+                                    "error": "provider_verification_required",
+                                    "errno": 400210,
+                                    "message": "Provider verification required",
+                                    "surl": surl,
+                                    "requires_verification": True,
+                                    "requires_password": False,
+                                }
                             
                             # Check if this is a token extraction failure (may need cookies)
                             if "jsToken" in error_msg or "cookie" in error_msg.lower():
                                 return {
-                                    "error": error_msg,
+                                    "error": "token_extraction_failed",
                                     "errno": -1,
-                                    "message": "Failed to extract authentication tokens. Cookies may be required for this share.",
+                                    "message": "Failed to extract authentication tokens. Provider may require verification or cookies.",
                                 }
                             
                             return {
                                 "error": error_msg,
                                 "errno": -1,
+                                "message": error_msg,
                             }
                         
                         # With raw=1, the response format is: {"source": "live", "upstream": {...}}
@@ -145,33 +174,39 @@ async def fetch_download_link(
                         
                         # Handle TeraBox API errors
                         errno = api_response.get("errno", -1)
+                        errmsg = str(api_response.get("errmsg", ""))
                         logging.info(f"Response errno: {errno}")
                         
                         # Handle verification required
-                        if errno == 400141 or errno == 4000020:
+                        if (
+                            errno in (400141, 4000020, 400210, 400310)
+                            or "need verify" in errmsg.lower()
+                            or "verify_v2" in errmsg.lower()
+                        ):
                             if not is_last_attempt:
                                 logging.warning(f"Upstream returned errno {errno} with cookies. Retrying without cookies.")
                                 continue
                             
-                            logging.warning("Link requires verification")
+                            logging.warning(f"Link requires verification (errno: {errno}, errmsg: {errmsg})")
                             return {
-                                "error": "Verification required",
+                                "error": "provider_verification_required",
                                 "errno": errno,
-                                "message": "This link requires password or captcha verification",
+                                "message": errmsg or "This link requires password or captcha verification",
                                 "surl": surl,
-                                "requires_password": True,
+                                "requires_verification": True,
+                                "requires_password": bool(errno in (400141, 4000020)),
                             }
                         
                         # Handle other errors
                         if errno != 0:
-                            error_msg = api_response.get("errmsg", "Unknown error")
+                            error_msg = errmsg or "Unknown error"
                             logging.error(f"API error {errno}: {error_msg}")
-                            return {"error": error_msg, "errno": errno}
+                            return {"error": "provider_error", "errno": errno, "message": error_msg}
                         
                         # Check if we got the file list
                         if "list" not in api_response:
                             logging.error(f"No file list in response. Response keys: {list(api_response.keys())}")
-                            return {"error": "No files found in response", "errno": -1}
+                            return {"error": "no_files_found", "errno": -1, "message": "No file list returned by provider"}
                         
                         files = api_response["list"]
                         logging.info(f"Found {len(files)} items")
