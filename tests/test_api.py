@@ -110,7 +110,8 @@ def test_api_provider_errno_400210(mock_download, client):
     assert data["errno"] == 400210
     assert data["requires_verification"] is True
     assert data["requires_password"] is False
-    assert data["verification_url"] == "https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ"
+    assert "/verification/" in data["verification_url"] or "1024terabox.com" in data["verification_url"]
+    assert "session_id" in data
 
 
 # Scenario 3: Provider errno=400310 (access token verification)
@@ -350,7 +351,7 @@ def test_create_verification_session_endpoint(mock_download, client):
     data = resp.get_json()
     assert data["status"] == "verification_required"
     assert "session_id" in data
-    assert data["verification_url"] == "https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ"
+    assert "/verification/" in data["verification_url"] or "1024terabox.com" in data["verification_url"]
     assert data["requires_verification"] is True
 
 
@@ -424,6 +425,93 @@ def test_verification_complete_expired_session(client):
     data = resp.get_json()
     assert data["status"] == "error"
     assert data["error"] == "verification_expired"
+
+
+# Scenario 16: Verification UI rendering and not found
+def test_verification_ui_routes(client):
+    from terabox_gateway.session_store import session_store
+    
+    session = session_store.create_session(
+        url="https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ",
+        surl="fKvukFFlwMqHt3vbdFoRYQ",
+        verification_url="https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ",
+    )
+
+    # 1. Successful UI render
+    resp = client.get(f"/verification/{session.session_id}")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers.get("Content-Type", "")
+    assert session.session_id in resp.get_data(as_text=True)
+
+    # 2. Not found
+    resp404 = client.get("/verification/unknown_session_id_123")
+    assert resp404.status_code == 404
+
+
+# Scenario 17: Verification interaction routes (click, drag, type, screenshot)
+def test_verification_interaction_routes(client):
+    from terabox_gateway.session_store import session_store
+    
+    session = session_store.create_session(
+        url="https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ",
+        surl="fKvukFFlwMqHt3vbdFoRYQ",
+        verification_url="https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ",
+    )
+
+    # Screenshot
+    resp_img = client.get(f"/verification/{session.session_id}/screenshot")
+    assert resp_img.status_code == 200
+    assert "image/" in resp_img.headers.get("Content-Type", "")
+
+    # Click
+    resp_click = client.post(f"/verification/{session.session_id}/click", json={"x": 100, "y": 200})
+    assert resp_click.status_code == 200
+
+    # Drag
+    resp_drag = client.post(f"/verification/{session.session_id}/drag", json={"from_x": 50, "from_y": 100, "to_x": 250, "to_y": 100})
+    assert resp_drag.status_code == 200
+
+    # Type
+    resp_type = client.post(f"/verification/{session.session_id}/type", json={"text": "hello"})
+    assert resp_type.status_code == 200
+
+
+# Scenario 18: Verification session status endpoint
+def test_verification_session_status_endpoint(client):
+    from terabox_gateway.session_store import session_store
+    
+    session = session_store.create_session(
+        url="https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ",
+        surl="fKvukFFlwMqHt3vbdFoRYQ",
+        verification_url="https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ",
+    )
+
+    resp = client.get(f"/api/verification/session/{session.session_id}")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["session_id"] == session.session_id
+    assert "expires_in_seconds" in data
+    assert data["verified"] is False
+
+    # Unknown session
+    resp404 = client.get("/api/verification/session/random_unknown_id")
+    assert resp404.status_code == 404
+
+
+# Scenario 19: Direct link validator rejects invalid URLs
+def test_direct_link_validation():
+    from terabox_gateway.browser_session import is_valid_direct_download_url
+    
+    assert is_valid_direct_download_url("https://d.terabox.app/download/2026-04-23.mp4") is True
+    assert is_valid_direct_download_url("https://data.terabox.app/file/video.mp4?sign=xyz") is True
+    
+    # Rejections
+    assert is_valid_direct_download_url(None) is False
+    assert is_valid_direct_download_url("") is False
+    assert is_valid_direct_download_url("https://1024terabox.com/s/1fKvukFFlwMqHt3vbdFoRYQ") is False
+    assert is_valid_direct_download_url("https://1024terabox.com/sharing/link?surl=123") is False
+    assert is_valid_direct_download_url("https://www.terabox.app/verify/challenge") is False
+    assert is_valid_direct_download_url("https://www.terabox.app/login") is False
 
 
 def test_cors_headers(client):

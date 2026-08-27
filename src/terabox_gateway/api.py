@@ -34,6 +34,8 @@ from .terabox_client import (
     _normalize_api2_items,
 )
 from .session_store import session_store, is_valid_direct_download_url
+from .browser_session import browser_session_manager, BrowserVerificationSession
+from .verification_ui import render_verification_ui
 from .rate_limiter import rate_limit
 from . import cache
 
@@ -309,14 +311,23 @@ async def api():
             
             session_id = None
             if is_verification:
-                session = session_store.create_session(
+                browser_session = await browser_session_manager.create_session(
+                    url=url,
+                    surl=surl,
+                    password=password,
+                    verification_url=v_url,
+                    files=link_data if isinstance(link_data, list) else None,
+                )
+                session_id = browser_session.session_id
+                # Also record in session_store for compatibility
+                session_store.create_session(
                     url=url,
                     surl=surl,
                     verification_url=v_url,
                     password=password,
                     challenge_state={"errno": err_code, "errmsg": link_data.get("message")},
+                    files=link_data if isinstance(link_data, list) else None,
                 )
-                session_id = session.session_id
 
             if link_data.get("requires_password"):
                 status_code = 400
@@ -334,12 +345,11 @@ async def api():
                 "message": link_data.get("message") or link_data.get("error") or "Provider resolution failed",
                 "requires_verification": is_verification,
                 "requires_password": link_data.get("requires_password", False),
-                "verification_url": v_url if is_verification else None,
+                "verification_url": f"/verification/{session_id}" if session_id else (v_url if is_verification else None),
                 "stage": "provider_resolution",
             }
             if session_id:
                 err_resp["session_id"] = session_id
-                err_resp["verification_transfer_supported"] = False  # TeraBox browser CAPTCHAs are bound to browser cookies/IP
 
             return jsonify(err_resp), status_code
 
@@ -374,14 +384,21 @@ async def api():
                 v_url = resolved_data.get("verification_url") or url
                 session_id = None
                 if is_verification:
-                    session = session_store.create_session(
+                    browser_session = await browser_session_manager.create_session(
+                        url=url,
+                        surl="",
+                        password=password,
+                        verification_url=v_url,
+                        files=link_data if isinstance(link_data, list) else None,
+                    )
+                    session_id = browser_session.session_id
+                    session_store.create_session(
                         url=url,
                         surl="",
                         verification_url=v_url,
                         password=password,
                         challenge_state={"errno": err_code, "errmsg": resolved_data.get("message")},
                     )
-                    session_id = session.session_id
 
                 status_code = 400 if resolved_data.get("requires_password") else (409 if is_verification else 502)
                 err_resp = {
@@ -391,12 +408,11 @@ async def api():
                     "message": resolved_data.get("message") or resolved_data.get("error") or "Direct link resolution failed",
                     "requires_verification": is_verification,
                     "requires_password": resolved_data.get("requires_password", False),
-                    "verification_url": v_url if is_verification else None,
+                    "verification_url": f"/verification/{session_id}" if session_id else (v_url if is_verification else None),
                     "stage": "direct_link_resolution",
                 }
                 if session_id:
                     err_resp["session_id"] = session_id
-                    err_resp["verification_transfer_supported"] = False
 
                 return jsonify(err_resp), status_code
 
@@ -433,6 +449,99 @@ async def api():
             ),
             500,
         )
+
+
+@app.route("/verification/<session_id>", methods=["GET"])
+async def verification_ui_route(session_id):
+    """Serve the interactive server-side browser verification page."""
+    session = browser_session_manager.get_session(session_id)
+    if not session:
+        # Check fallback session
+        fb_session = session_store.get_session(session_id)
+        if not fb_session:
+            return jsonify({
+                "status": "error",
+                "error": "session_not_found",
+                "message": "Verification session has expired or does not exist",
+            }), 404
+
+    # Ensure browser context is loading the page
+    await browser_session_manager.ensure_page_loaded(session_id)
+    
+    html = render_verification_ui(session_id)
+    return Response(html, mimetype="text/html")
+
+
+@app.route("/verification/<session_id>/screenshot", methods=["GET"])
+async def verification_screenshot_route(session_id):
+    """Stream live screenshot of server-side browser page."""
+    screenshot = await browser_session_manager.get_screenshot(session_id)
+    if not screenshot:
+        # Return 1x1 blank transparent gif or 204
+        blank_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\nIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
+        return Response(blank_png, mimetype="image/png")
+    return Response(screenshot, mimetype="image/jpeg")
+
+
+@app.route("/verification/<session_id>/click", methods=["POST"])
+async def verification_click_route(session_id):
+    """Forward mouse click event to server-side browser page."""
+    data = request.get_json(silent=True) or {}
+    x = int(data.get("x", 0))
+    y = int(data.get("y", 0))
+    success = await browser_session_manager.forward_click(session_id, x, y)
+    return jsonify({"status": "ok" if success else "error"})
+
+
+@app.route("/verification/<session_id>/drag", methods=["POST"])
+async def verification_drag_route(session_id):
+    """Forward mouse drag/slider event to server-side browser page."""
+    data = request.get_json(silent=True) or {}
+    from_x = int(data.get("from_x", 0))
+    from_y = int(data.get("from_y", 0))
+    to_x = int(data.get("to_x", 0))
+    to_y = int(data.get("to_y", 0))
+    success = await browser_session_manager.forward_drag(session_id, from_x, from_y, to_x, to_y)
+    return jsonify({"status": "ok" if success else "error"})
+
+
+@app.route("/verification/<session_id>/type", methods=["POST"])
+async def verification_type_route(session_id):
+    """Forward keyboard text typing to server-side browser page."""
+    data = request.get_json(silent=True) or {}
+    text = str(data.get("text", ""))
+    success = await browser_session_manager.forward_type(session_id, text)
+    return jsonify({"status": "ok" if success else "error"})
+
+
+@app.route("/api/verification/session/<session_id>", methods=["GET"])
+@rate_limit
+async def get_verification_session_status_route(session_id):
+    """Get sanitized status of a verification session."""
+    session = browser_session_manager.get_session(session_id)
+    if not session:
+        session = session_store.get_session(session_id)
+        if not session:
+            return jsonify({
+                "status": "error",
+                "error": "session_not_found",
+                "message": "Verification session has expired or does not exist",
+            }), 404
+
+    if session.is_expired():
+        return jsonify({
+            "status": "error",
+            "error": "verification_expired",
+            "message": "Verification session has expired",
+        }), 410
+
+    state_str = getattr(session, "state", getattr(session, "verification_state", "pending"))
+    return jsonify({
+        "status": f"verification_{state_str}",
+        "session_id": session.session_id,
+        "expires_in_seconds": session.time_remaining_seconds(),
+        "verified": getattr(session, "verified", False),
+    }), 200
 
 
 @app.route("/api/verification/session", methods=["GET", "POST"])
@@ -478,7 +587,13 @@ async def create_verification_session_route():
             v_url = link_data.get("verification_url") or url
             surl = link_data.get("surl", "")
             
-            session = session_store.create_session(
+            browser_session = await browser_session_manager.create_session(
+                url=url,
+                surl=surl,
+                password=password,
+                verification_url=v_url,
+            )
+            session_store.create_session(
                 url=url,
                 surl=surl,
                 verification_url=v_url,
@@ -488,24 +603,24 @@ async def create_verification_session_route():
             
             return jsonify({
                 "status": "verification_required",
-                "session_id": session.session_id,
-                "verification_url": session.verification_url,
+                "session_id": browser_session.session_id,
+                "verification_url": f"/verification/{browser_session.session_id}",
                 "requires_verification": True,
-                "expires_in_seconds": session.time_remaining_seconds(),
+                "expires_in_seconds": browser_session.time_remaining_seconds(),
                 "stage": "verification_session_created"
             }), 409
 
         # If metadata is already resolved:
-        session = session_store.create_session(
+        browser_session = await browser_session_manager.create_session(
             url=url,
             surl="",
-            verification_url=url,
             password=password,
+            verification_url=url,
             files=link_data if isinstance(link_data, list) else None,
         )
         return jsonify({
             "status": "ready",
-            "session_id": session.session_id,
+            "session_id": browser_session.session_id,
             "requires_verification": False,
             "files": await _normalize_api2_items(link_data) if isinstance(link_data, list) else [],
             "stage": "share_metadata_success"
@@ -524,7 +639,7 @@ async def create_verification_session_route():
 @app.route("/api/verification/complete", methods=["POST"])
 @rate_limit
 async def verification_complete_route():
-    """Controlled retry endpoint to resume direct link resolution with an authorized session."""
+    """Controlled retry endpoint to resume direct link resolution with the server-side browser session."""
     try:
         data = request.get_json(silent=True) or {}
         session_id = data.get("session_id") or request.args.get("session_id")
@@ -537,6 +652,38 @@ async def verification_complete_route():
                 "stage": "parameter_validation"
             }), 400
             
+        b_session = browser_session_manager.get_session(session_id)
+        if b_session:
+            if b_session.is_expired():
+                logger.info(f"[Verification] verification_expired sessionId={session_id[:8]}***")
+                return jsonify({
+                    "status": "error",
+                    "error": "verification_expired",
+                    "message": "Verification session has expired",
+                }), 410
+
+            success, files, err = await browser_session_manager.attempt_direct_resolution(session_id)
+            if success and files:
+                return jsonify({
+                    "status": "success",
+                    "session_id": session_id,
+                    "files": files,
+                }), 200
+            elif err == "provider_verification_required":
+                return jsonify({
+                    "status": "error",
+                    "error": "provider_verification_required",
+                    "requires_verification": True,
+                    "session_id": session_id,
+                }), 409
+            elif err == "Session expired or not found":
+                return jsonify({
+                    "status": "error",
+                    "error": "verification_expired",
+                    "message": "Verification session has expired",
+                }), 410
+
+        # Fallback to session_store
         session = session_store.get_session(session_id)
         if not session:
             logger.info(f"[TeraBox Diagnostics] stage=verification_expired sessionId={session_id[:8]}***")

@@ -138,31 +138,27 @@ async def fetch_download_link(
                                         or "verify_v2" in upstream_msg.lower()
                                         or "verification" in upstream_msg.lower()
                                     ):
-                                        if not is_last_attempt:
-                                            logger.warning("Upstream returned verification requirement with cookies. Retrying without cookies.")
-                                            should_retry = True
-                                        else:
-                                            log_sanitized_stage_diagnostics(
-                                                stage="provider_resolution",
-                                                endpoint_path=PROXY_BASE_URL,
-                                                http_status=response.status,
-                                                errno=upstream_errno or 400210,
-                                                errmsg=upstream_msg,
-                                                cookies=cookies_to_send,
-                                                verification_url=verification_link,
-                                                interactive_verification=True,
-                                            )
-                                            return {
-                                                "status": "error",
-                                                "error": "provider_verification_required",
-                                                "errno": upstream_errno or 400210,
-                                                "message": upstream_msg or "This link requires interactive or captcha verification from the provider",
-                                                "surl": clean_code,
-                                                "requires_verification": True,
-                                                "requires_password": bool(upstream_errno in (4000020, 400141)),
-                                                "verification_url": verification_link,
-                                                "stage": "provider_resolution",
-                                            }
+                                        log_sanitized_stage_diagnostics(
+                                            stage="provider_resolution",
+                                            endpoint_path=PROXY_BASE_URL,
+                                            http_status=response.status,
+                                            errno=upstream_errno or 400210,
+                                            errmsg=upstream_msg,
+                                            cookies=cookies_to_send,
+                                            verification_url=verification_link,
+                                            interactive_verification=True,
+                                        )
+                                        return {
+                                            "status": "error",
+                                            "error": "provider_verification_required",
+                                            "errno": upstream_errno or 400210,
+                                            "message": upstream_msg or "This link requires interactive or captcha verification from the provider",
+                                            "surl": clean_code,
+                                            "requires_verification": True,
+                                            "requires_password": bool(upstream_errno in (4000020, 400141)),
+                                            "verification_url": verification_link,
+                                            "stage": "provider_resolution",
+                                        }
                             except Exception as e:
                                 logger.debug(f"Failed to parse error response JSON: {e}")
                             

@@ -1,5 +1,5 @@
 Flask[async]>=3.1,<4
 Werkzeug>=3.1,<4
 aiohttp>=3.8,<4
+playwright>=1.40.0
 gunicorn>=21.2.0; sys_platform != 'win32'
-
